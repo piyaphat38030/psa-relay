@@ -1,0 +1,2 @@
+# Zero third-party dependencies — Python 3.11+ stdlib only.
+# (Kept for documentation; pip install not required.)

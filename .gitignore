@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+*.local
+
+# OS
+.DS_Store
+
+# Build artifacts
+deliverables/.submission_staging/
+deliverables/RELAY_Submission_30Aug.zip
+
+# Large local recordings (submit via organiser portal, not git)
+*.mp4
+
+# Office temp files
+~$*

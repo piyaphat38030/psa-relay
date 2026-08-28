@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+@page { size: A4; margin: 14mm; }
+body { font-family: Calibri, Arial, sans-serif; font-size: 11pt; line-height: 1.45; color: #222; }
+h1 { font-size: 18pt; color: #051C2C; margin-bottom: 4px; }
+h2 { font-size: 13pt; color: #0070AD; margin-top: 18px; margin-bottom: 6px; }
+p { margin: 6px 0; }
+li { margin: 3px 0 3px 18px; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 10pt; }
+th, td { border: 1px solid #ccc; padding: 5px 8px; text-align: left; }
+th { background: #051C2C; color: white; }
+hr { border: none; border-top: 1px solid #ddd; margin: 14px 0; }
+</style></head><body>
+<h1>RELAY — Solution Architecture</h1>
+<br>
+<p><strong>PSA Code Sprint 2.0 · Agentic AI in Action</strong></p>
+<br>
+<p>This document covers how RELAY is put together: the execution flow, the main design choices we made, what impact we think it can have, and how we handle security, safety, and scaling.</p>
+<br>
+<hr>
+<br>
+<h2>1. The problem we picked</h2>
+<br>
+<p>Most containers at PSA are not simple import/export cargo. They are transshipment — one vessel in, another vessel out, usually on a tight window.</p>
+<br>
+<p>When something breaks — a feeder arrives late, a crane goes down, yard or AIS data goes stale — planners have to work out quickly which connections are actually at risk and what recovery is still physically possible. That information sits across different systems, and the decisions have real cost: missed connections mean extra dwell, rehandling, and downstream schedule knock-on.</p>
+<br>
+<p>We built RELAY around one objective: recover as many connections as we can, without the system quietly dispatching yard moves or cutoff changes on its own.</p>
+<br>
+<hr>
+<br>
+<h2>2. What RELAY does</h2>
+<br>
+<p>RELAY is a human-in-the-loop agent workflow for connection recovery. In plain terms:</p>
+<br>
+<li>Something triggers an incident (ETA change, crane status, bad data).</li>
+<li>Agents pull terminal state and score which transshipment links are inside the miss window.</li>
+<li>The system generates a few recovery plans and simulates them against the twin.</li>
+<li>A critic pass can reject plans that look good on paper but fail operationally.</li>
+<li>High-impact actions — restow, cutoff negotiation, holds — stop for planner approval.</li>
+<li>Everything is written to an execution trace: decisions, tool calls, errors, approvals, outcomes.</li>
+<br>
+<p>We did not aim for maximum autonomy. The kickoff brief is explicit that higher autonomy is not automatically better. Notifications and analysis can run on their own; moves that affect the yard or a sailing need a human sign-off.</p>
+<br>
+<hr>
+<br>
+<h2>3. System layout</h2>
+<br>
+<pre style="font-family:Consolas,monospace;font-size:9pt;background:#f5f5f5;padding:8px;border:1px solid #ddd;white-space:pre-wrap;">
+┌─────────────────────────────────────────────────────────────┐
+│                     Ops Console (React)                     │
+│   KPIs · at-risk table · plan compare · approval · trace    │
+└────────────────────────────┬────────────────────────────────┘
+                             │ HTTP JSON API
+┌────────────────────────────▼────────────────────────────────┐
+│                 Orchestrator (state machine)                │
+│  DETECTED → ANALYSING → PLANNING → CRITIQUE →               │
+│  AWAITING_APPROVAL → EXECUTING → CLOSED / ESCALATED         │
+├──────────┬──────────┬──────────┬──────────┬────────┬────────┤
+│ Sentinel │ Analyst  │ Planner  │  Critic  │Executor│Auditor │
+└────┬─────┴────┬─────┴────┬─────┴────┬─────┴───┬────┴───┬────┘
+     │          │          │          │         │        │
+     └──────────┴──────────┴────┬─────┴─────────┴────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │   Tool registry       │
+                    │  retries · allowlist  │
+                    │  failure injection    │
+                    └───────────┬───────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+        Twin state        Risk engine        Policy gates
+     (vessels/yard)   (deterministic)    (HITL thresholds)
+</pre>
+<br>
+<p><strong>Console</strong> — what the planner sees: at-risk boxes, plan comparison, approval buttons, live trace.</p>
+<br>
+<p><strong>Orchestrator</strong> — a Python state machine we wrote ourselves. It moves an incident through defined phases and calls the right agent at each step. We kept this explicit rather than wrapping a generic agent framework, because the brief rewards workflow design the team actually thought through.</p>
+<br>
+<p><strong>Domain engine</strong> — deterministic code for connection-buffer risk and plan simulation. The numbers in the demo are reproducible; agents coordinate tools, they do not invent the maths.</p>
+<br>
+<p><strong>Tool layer</strong> — mock terminal APIs (schedule, yard, crane, work orders, notifications). Same shapes we would expect from real integration later.</p>
+<br>
+<hr>
+<br>
+<h2>4. How a run works (late feeder example)</h2>
+<br>
+<table>
+<tr><th>Step</th><th>Who</th><th>What happens</th></tr>
+<tr><td>1</td><td>Sentinel</td><td>Reads the trigger, updates feeder ETA in the twin, opens the incident</td></tr>
+<tr><td>2</td><td>Analyst</td><td>Calls yard and connections tools; builds the at-risk list</td></tr>
+<tr><td>3</td><td>Planner</td><td>Drafts PLAN-A/B/C, runs each through the simulator</td></tr>
+<tr><td>4</td><td>Critic</td><td>Flags infeasible options (e.g. PLAN-X when a crane is down)</td></tr>
+<tr><td>5</td><td>System</td><td>Runs low-risk notices; queues restow/cutoff actions behind approval</td></tr>
+<tr><td>6</td><td>Planner (human)</td><td>Approves or rejects in the console</td></tr>
+<tr><td>7</td><td>Executor + Auditor</td><td>Dispatches work orders with an approval token; re-scores; closes incident</td></tr>
+</table>
+<br>
+<p>If the planner rejects, the incident escalates to the shift superintendent instead of silently stopping.</p>
+<br>
+<hr>
+<br>
+<h2>5. Design choices (and why)</h2>
+<br>
+<p><strong>Transshipment-first.</strong> We wanted a PSA-specific problem, not a generic port chatbot. Connection buffer — time left before an outbound cutoff — is the metric planners actually care about.</p>
+<br>
+<p><strong>Deterministic scoring + agent coordination.</strong> LLMs are good at narration; they are a poor place to put audited risk numbers. Our engine calculates buffer and simulates plans in Python. Agents decide what to call and when.</p>
+<br>
+<p><strong>Separate critic agent.</strong> Planner and critic are split so dissent is real. The crane scenario shows PLAN-X getting rejected even though it scores well.</p>
+<br>
+<p><strong>Approval tokens on dispatch.</strong> Work orders cannot go live without a token issued after human approval. You cannot bypass the gate by hitting the API directly.</p>
+<br>
+<p><strong>No external dependencies for the demo.</strong> Backend is stdlib Python only — no pip install, no API keys. Judges can run it locally without setup pain.</p>
+<br>
+<p><strong>Token estimates in the trace.</strong> We log approximate compute per step so efficiency is visible, not hand-waved.</p>
+<br>
+<hr>
+<br>
+<h2>6. Data and assumptions</h2>
+<br>
+<p>PSA did not provide datasets, LLM keys, or credits for this round (organiser clarification on Telegram). We built a synthetic Tuas-style twin: vessels, ETAs, yard blocks, cranes, transshipment boxes, and a simple miss-cost model.</p>
+<br>
+<table>
+<tr><th>Source</th><th>Used for</th></tr>
+<tr><td>Our twin</td><td>All runtime numbers in the demo</td></tr>
+<tr><td>Public PSA/MPA stats</td><td>Problem framing only (~90% transshipment; ~90% off-schedule in 1H 2024; +8% rehandling)</td></tr>
+<tr><td>External LLM</td><td>Not used at runtime</td></tr>
+</table>
+<br>
+<p><strong>Assumptions we state openly:</strong></p>
+<br>
+<li>Connection buffer ≈ outbound cutoff minus feeder availability minus handling and a safety margin.</li>
+<li>Miss costs are illustrative ($1,800 baseline with uplifts for premium/reefer/DG).</li>
+<li>Scenario 3 deliberately breaks the yard API so we can show retry → cache fallback.</li>
+<li>High-impact tools require an approval token.</li>
+<br>
+<p>More detail in presentation Appendix A.</p>
+<br>
+<hr>
+<br>
+<h2>7. Impact (demo twin — illustrative)</h2>
+<br>
+<p>On our sample terminal, approved plans recover most or all at-risk connections in the first two scenarios:</p>
+<br>
+<table>
+<tr><th>Scenario</th><th>At-risk</th><th>Plan</th><th>Saved</th><th>Notes</th></tr>
+<tr><td>Late feeder</td><td>7</td><td>PLAN-B</td><td>7</td><td>Cutoff extension + selective restow</td></tr>
+<tr><td>Crane outage</td><td>7</td><td>PLAN-A</td><td>7</td><td>Critic kills infeasible PLAN-X</td></tr>
+<tr><td>Uncertainty + API fail</td><td>12</td><td>PLAN-B</td><td>5</td><td>Partial recovery; residual risk left visible</td></tr>
+</table>
+<br>
+<p>These are not live PORTNET numbers. They show that the loop works end-to-end and that the critic and fallback paths change outcomes in sensible ways.</p>
+<br>
+<p><strong>If shortlisted:</strong> we would run shadow mode with PSA mentors, tune weights with real planners, and swap mocks for PORTNET/CITOS-class APIs while keeping the same agent and policy contracts.</p>
+<br>
+<p><strong>Where this fits publicly:</strong> MPA&#x27;s Maritime Digital Twin is mainly situational awareness. RELAY sits on top as a recovery layer — scenario ranking, human gates, audit trail — when schedules break.</p>
+<br>
+<hr>
+<br>
+<h2>8. Security, safety, scaling</h2>
+<br>
+<p><strong>Access control (production path).</strong> Tools are allowlisted — no arbitrary shell or SQL. High-impact calls need an approval token. Console decisions are attributed (`decided_by`). Real deployment would add SSO and role-based access (duty officer / planner / superintendent).</p>
+<br>
+<p><strong>Safety.</strong> DG and reefer flags tighten gates. Critic blocks capacity-infeasible plans. When AIS quality drops, uncertainty bands widen before scoring. Tool failures: retry, then fall back to last-known twin cache, then escalate if needed.</p>
+<br>
+<p><strong>Scale.</strong> Risk scoring is O(containers) deterministic work — it does not scale linearly with LLM cost. Traces are append-only per incident, so you can audit without re-running agents. Multiple terminals could shard by cluster with a shared policy pack.</p>
+<br>
+<p><strong>Errors.</strong> Retryable vs fatal tool errors are distinguished. Every failure shows up as a `tool_error` event in the trace. Rejection triggers superintendent notification with the full dossier.</p>
+<br>
+<hr>
+<br>
+<h2>9. Repo layout</h2>
+<br>
+<pre style="font-family:Consolas,monospace;font-size:9pt;background:#f5f5f5;padding:8px;border:1px solid #ddd;white-space:pre-wrap;">
+relay/
+  backend/app/          # API, orchestrator, risk engine, policy, tools, scenarios
+  backend/tests/        # Risk, policy, end-to-end scenario tests
+  frontend/             # Ops console
+deliverables/           # Slides, this doc, demo scripts
+research/               # Brief notes, domain research, audit log
+</pre>
+<br>
+<hr>
+<br>
+<h2>10. Run locally</h2>
+<br>
+<pre style="font-family:Consolas,monospace;font-size:9pt;background:#f5f5f5;padding:8px;border:1px solid #ddd;white-space:pre-wrap;">
+# Terminal 1 — API
+cd relay/backend &amp;&amp; PYTHONPATH=. python3 -m app.main
+
+# Terminal 2 — UI
+cd relay/frontend &amp;&amp; npm install &amp;&amp; npm run dev
+</pre>
+<br>
+<p>Open http://localhost:5173, run <strong>Late feeder</strong>, approve the plan, and follow the trace through to closed.</p>
+</body></html>
