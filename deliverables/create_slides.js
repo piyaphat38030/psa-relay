@@ -624,8 +624,8 @@ function appendixBanner(slide, label) {
   const links = [
     {
       label: 'Solution repo',
-      text: 'GitHub / Cursor repo — paste public URL before submit',
-      url: 'https://github.com/',
+      text: 'https://github.com/piyaphat38030/psa-relay',
+      url: 'https://github.com/piyaphat38030/psa-relay',
     },
     {
       label: 'Architecture brief',
