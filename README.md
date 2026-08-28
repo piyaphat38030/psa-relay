@@ -1,5 +1,7 @@
 # PSA Code Sprint 2.0 — RELAY
 
+**Repo:** https://github.com/piyaphat38030/psa-relay
+
 **Chosen project:** Agentic transshipment connection continuity (human-in-the-loop).
 
 ## Why this wins
